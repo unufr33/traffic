@@ -31,7 +31,6 @@ when they reach a stop, and when the first and last metro train leaves. The inte
 With Docker:
 
 ```bash
-docker volume create sofia-transit-data   # first time only: keeps the downloaded timetable
 docker compose up -d --build
 ```
 
