@@ -11,4 +11,3 @@ services:
 
 volumes:
   sofia-transit-data:
-    external: true
