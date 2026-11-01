@@ -1,7 +1,5 @@
 """Live map of Sofia: public transport by line (with stops and arrival predictions) and air quality."""
 import asyncio
-import colorsys
-import json
 import os
 import re
 from datetime import datetime
@@ -10,12 +8,15 @@ from zoneinfo import ZoneInfo
 from nicegui import run, ui
 
 import air
+import theme
+from markers import air_icon, badge_icon, direction_color, line_colors, station_icon, stop_icon
 from transit import TYPE_COLORS, TYPE_NAMES, Transit
 
 SOFIA = (42.6977, 23.3219)
 # route_type (None = any) -> (label, material icon)
 KINDS = {None: ("Всички", "directions_transit"), 3: ("Автобус", "directions_bus"), 11: ("Тролей", "electric_bolt"), 0: ("Трамвай", "tram")}
 REFRESH_S = 60
+SIDEBAR_PX = 390  # width of the sidebar; the map keeps clear of it when zooming to results
 SOFIA_TZ = ZoneInfo("Europe/Sofia")
 
 transit = None  # shared, read-only timetable; built once
@@ -32,76 +33,9 @@ def natural(name: str):
     return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", name)]
 
 
-def badge_icon(color: str, text: str = "", route_type: int | None = None) -> str:
-    """JS for a Leaflet divIcon: a colored pill with the line number inside (plain dot when no text)."""
-    h = 26 if text else 20
-    w = max(h, 9 * len(text) + 14) if text else h
-    pick = ""
-    if text:  # clicking a numbered badge asks the server to isolate that line
-        pick = f""" onclick='emitEvent("line_pick", {json.dumps({"line": text, "type": route_type})})'"""
-    html = (
-        f'<div{pick} style="cursor:{"pointer" if text else "default"};box-sizing:border-box;width:{w}px;height:{h}px;border-radius:{h // 2}px;background:{color};'
-        f'border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.55);color:#fff;'
-        f'font:700 12px/{h - 4}px sans-serif;text-align:center;white-space:nowrap">{text}</div>'
-    )
-    return f"L.divIcon({{html: {json.dumps(html)}, className: '', iconSize: [{w}, {h}], iconAnchor: [{w // 2}, {h // 2}]}})"
-
-
-def station_icon(lines, stop_id: str) -> str:
-    """JS for a metro station badge: an "М" in a white disc ringed in the colors of the lines that stop there."""
-    colors = [c for _, c in lines]
-    if len(colors) == 1:
-        ring = colors[0]
-    else:
-        step = 100 / len(colors)
-        ring = "conic-gradient(" + ",".join(f"{c} {i * step:.0f}% {(i + 1) * step:.0f}%" for i, c in enumerate(colors)) + ")"
-    html = (
-        f"<div onclick='emitEvent(\"station_pick\", {json.dumps({'id': stop_id})})' "
-        f'style="cursor:pointer;box-sizing:border-box;width:26px;height:26px;border-radius:50%;background:{ring};'
-        f'box-shadow:0 1px 4px rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center">'
-        f'<div style="width:18px;height:18px;border-radius:50%;background:#fff;color:#222;'
-        f'font:800 12px/18px sans-serif;text-align:center">М</div></div>'
-    )
-    return f"L.divIcon({{html: {json.dumps(html)}, className: '', iconSize: [26, 26], iconAnchor: [13, 13]}})"
-
-
-def stop_icon(color: str, stop_id: str) -> str:
-    """JS for a stop marker: a white disc ringed in the line's color. Clicking asks the server for arrivals."""
-    html = (
-        f"<div onclick='emitEvent(\"stop_pick\", {json.dumps({'id': stop_id})})' "
-        f'style="cursor:pointer;box-sizing:border-box;width:12px;height:12px;border-radius:50%;background:#fff;'
-        f'border:3px solid {color};box-shadow:0 1px 2px rgba(0,0,0,.5)"></div>'
-    )
-    return f"L.divIcon({{html: {json.dumps(html)}, className: '', iconSize: [12, 12], iconAnchor: [6, 6]}})"
-
-
-def air_icon(color: str, pm25: float) -> str:
-    """JS for a sensor badge: the rounded PM2.5 value on the air-quality band color."""
-    text = f"{pm25:.0f}"
-    w = max(24, 8 * len(text) + 12)
-    fg = "#222" if color in air.DARK_TEXT else "#fff"
-    html = (
-        f'<div style="box-sizing:border-box;width:{w}px;height:24px;border-radius:12px;background:{color};'
-        f'border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.55);color:{fg};'
-        f'font:700 11px/20px sans-serif;text-align:center">{text}</div>'
-    )
-    return f"L.divIcon({{html: {json.dumps(html)}, className: '', iconSize: [{w}, 24], iconAnchor: [{w // 2}, 12]}})"
-
-
-def direction_color(route_type: int, direction: int | None) -> str:
-    """Line color for a vehicle type; the second direction gets the hue rotated by ~160° so the two read apart."""
-    base = TYPE_COLORS.get(route_type, "#555555")
-    if not direction:
-        return base
-    r, g, b = (int(base[i:i + 2], 16) / 255 for i in (1, 3, 5))
-    h, l, sat = colorsys.rgb_to_hls(r, g, b)
-    r, g, b = colorsys.hls_to_rgb((h + 0.45) % 1, l, sat)
-    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
-
-
-def line_colors(lines):
-    """One distinct color per line, spread around the hue wheel (golden angle)."""
-    return {ln: f"hsl({i * 137.508 % 360:.0f},{80 if i % 2 else 65}%,{42 if i % 3 else 52}%)" for i, ln in enumerate(lines)}
+def chip(text: str, color: str, text_color: str = "#fff"):
+    """A rounded line badge, like the ones on the map."""
+    return ui.label(text).classes("chip").style(f"background:{color};color:{text_color}")
 
 
 @ui.page("/")
@@ -109,64 +43,34 @@ async def index():
     global transit, transit_loading
     # Per-page state: each browser tab has its own map, layers and selection.
     route_ids = []
-    # colors: line -> color when showing a whole type; stop: (id, name) of the open arrivals panel
-    state = {"mode": "transport", "title": "", "colors": None, "type_view": None, "stop": None, "air_data": None}
+    # colors: line -> color when showing a whole type; stop: (id, name) of the open arrivals panel;
+    # last: (line, type) to restore when coming back from the air-quality tab
+    state = {"mode": "transport", "title": "", "colors": None, "type_view": None, "stop": None, "air_data": None, "last": None, "closed": False}
     layers, route_layers, stop_layers, station_layers, air_layers = [], [], [], [], []
 
-    ui.add_head_html("<style>body{margin:0}.q-page{padding:0!important}</style>")
-    m = ui.leaflet(center=SOFIA, zoom=12).classes("w-full").style("height:100vh;width:100vw")
-    with ui.row().classes("absolute top-3 right-3 z-[1000] items-center bg-white rounded shadow px-3 py-1 gap-3"):
-        status = ui.label("Зареждане на разписанието…")
-        back = ui.button("Всички линии", icon="arrow_back", on_click=lambda: show("", state["type_view"])).props("dense flat")
-        back.set_visibility(False)
-        ui.button("Обнови", icon="refresh", on_click=lambda: refresh()).props("dense flat")
-        ui.button("Смени", icon="search", on_click=lambda: ask_line()).props("dense flat")
+    theme.apply()
+    dark = ui.dark_mode(False)
+    m = ui.leaflet(center=SOFIA, zoom=12).style("position:fixed;inset:0;width:100%;height:100%;z-index:0")
     spinner = ui.spinner(size="xl").classes("absolute-center z-[1000]")
 
-    # arrivals panel (opens when a stop is clicked)
-    with ui.card().classes("absolute bottom-6 left-3 z-[1000] w-72 p-3 gap-1 overflow-auto").style("max-height:75vh") as panel:
-        with ui.row().classes("w-full items-center justify-between no-wrap"):
-            panel_title = ui.label().classes("text-subtitle1 text-bold")
-            ui.button(icon="close", on_click=lambda: close_panel()).props("flat dense round")
-        panel_sub = ui.label().classes("text-xs text-grey-7")
-        panel_body = ui.column().classes("gap-1 w-full")
-    panel.set_visibility(False)
+    # ---- sidebar --------------------------------------------------------------------------------------------------
+    sidebar = ui.element("div").classes("glass sidebar absolute top-3 left-3 bottom-3 z-[1000] flex flex-col p-4 gap-3").style("width:min(390px,calc(100vw - 24px))")
+    with sidebar:
+        with ui.row().classes("items-center justify-between no-wrap w-full"):
+            with ui.row().classes("items-center gap-3 no-wrap"):
+                ui.icon("directions_transit").classes("text-white text-2xl p-2").style("border-radius:14px;background:linear-gradient(135deg,#2563eb,#7c3aed)")
+                with ui.column().classes("gap-0"):
+                    ui.label("София на живо").classes("text-lg font-bold leading-tight")
+                    ui.label("транспорт и качество на въздуха").classes("text-xs muted")
+            with ui.row().classes("gap-0 no-wrap"):
+                dark_btn = ui.button(icon="dark_mode", on_click=lambda: toggle_dark()).props("flat round dense").tooltip("Тъмен режим")
 
-    # which color is which direction (single-line view only)
-    with ui.card().classes("absolute bottom-6 right-3 z-[1000] p-3 gap-1") as direction_card:
-        ui.label("Посока към").classes("text-xs text-grey-7")
-        direction_body = ui.column().classes("gap-1")
-    direction_card.set_visibility(False)
+        with ui.tabs(value="transport", on_change=lambda e: on_tab(e.value)).props("dense no-caps align=justify indicator-color=primary").classes("w-full") as tabs:
+            ui.tab("transport", label="Транспорт", icon="directions_bus")
+            ui.tab("air", label="Въздух", icon="air")
+        tabs.set_visibility(False)  # until the timetable has loaded
 
-    # air-quality scale (only in that mode)
-    with ui.card().classes("absolute bottom-6 left-3 z-[1000] p-3 gap-1") as air_legend:
-        ui.label("ФПЧ2.5, µg/m³").classes("text-xs text-grey-7")
-        lower = 0
-        for limit, color, label in air.BANDS:
-            rng = f"{lower}–{limit}" if limit != float("inf") else f">{lower}"
-            with ui.row().classes("items-center gap-2 no-wrap"):
-                ui.element("span").style(f"width:14px;height:14px;border-radius:50%;background:{color};flex:none")
-                ui.label(f"{label} ({rng})").classes("text-sm")
-            lower = limit
-    air_legend.set_visibility(False)
-
-    with ui.dialog() as dialog, ui.card().classes("w-80"):
-        ui.label("Какво искате да следите?").classes("text-h6")
-        mode = {"v": "transport"}
-        mode_buttons = {}
-
-        def pick_mode(v):
-            mode["v"] = v
-            for k, b in mode_buttons.items():
-                b.props(f"color={'primary' if k == v else 'grey-7'}")
-                b.props("unelevated" if k == v else "outline")
-            transport_box.set_visibility(v == "transport")
-            air_box.set_visibility(v == "air")
-
-        with ui.row().classes("w-full justify-between no-wrap"):
-            for k, (label, icon) in {"transport": ("Транспорт", "directions_bus"), "air": ("Качество на въздуха", "air")}.items():
-                mode_buttons[k] = ui.button(label, icon=icon, on_click=lambda _, k=k: pick_mode(k)).props("stack dense no-caps").classes("flex-1")
-
+        # transport controls
         with ui.column().classes("w-full gap-2") as transport_box:
             kind = {"type": None}
             kind_buttons = {}
@@ -174,24 +78,79 @@ async def index():
             def pick_kind(t):
                 kind["type"] = t
                 for k, b in kind_buttons.items():
-                    b.props(f"color={'primary' if k == t else 'grey-7'}")
-                    b.props("unelevated" if k == t else "outline")
+                    b.props(remove="flat unelevated outline")
+                    b.props("unelevated color=primary text-color=white" if k == t else "flat color=grey-6")
+                    b.classes(remove="soft" if k == t else "", add="" if k == t else "soft")
 
-            with ui.row().classes("w-full justify-between no-wrap"):
+            with ui.row().classes("w-full no-wrap gap-2"):
                 for k, (label, icon) in KINDS.items():
-                    kind_buttons[k] = ui.button(label, icon=icon, on_click=lambda _, k=k: pick_kind(k)).props("stack dense no-caps").classes("flex-1")
-            pick_kind(None)
-            line_input = ui.input(label="Номер на линия (по избор при избран вид)", placeholder="напр. 280, 9, TM1, 7А").props("autofocus outlined dense").classes("w-full")
-        with ui.column().classes("w-full") as air_box:
-            ui.label("Измервания на фини прахови частици (ФПЧ2.5) от гражданските датчици на sensor.community около София.").classes("text-sm text-grey-8")
-        pick_mode("transport")
-        error = ui.label().classes("text-negative text-sm")
-        line_input.on("keydown.enter", lambda: submit())
-        ui.button("Покажи на картата", on_click=lambda: submit()).classes("w-full")
+                    kind_buttons[k] = ui.button(label, icon=icon, on_click=lambda _, k=k: pick_kind(k)).props("stack dense no-caps").classes("flex-1 kind-btn")
+            line_input = ui.input(placeholder="Номер на линия, напр. 280, 9, TM1, 7А").props("outlined rounded dense clearable").classes("w-full")
+            with line_input.add_slot("prepend"):
+                ui.icon("search")
+            error = ui.label().classes("text-negative text-sm")
+            ui.button("Покажи на картата", icon="map", on_click=lambda: submit()).props("rounded no-caps unelevated color=primary").classes("w-full")
+            ui.label("Оставете номера празен, за да видите всички линии от избрания вид.").classes("text-xs muted")
+            line_input.on("keydown.enter", lambda: submit())
+        transport_box.set_visibility(False)
+        pick_kind(None)
 
-    def ask_line():
-        error.set_text("")
-        dialog.open()
+        # results
+        details = ui.column().classes("sheet-scroll w-full gap-3").style("flex:1 1 0;min-height:0;overflow-y:auto")
+        with details:
+            with ui.row().classes("soft w-full items-center no-wrap px-3 py-1 gap-2"):
+                ui.icon("schedule").classes("muted")
+                status = ui.label("Зареждане на разписанието…").classes("text-sm flex-1")
+                back = ui.button(icon="arrow_back", on_click=lambda: show("", state["type_view"])).props("flat round dense").tooltip("Всички линии")
+                back.set_visibility(False)
+                ui.button(icon="refresh", on_click=lambda: refresh()).props("flat round dense").tooltip("Обнови")
+
+            with ui.column().classes("w-full items-center gap-2 py-6") as empty_hint:
+                ui.icon("touch_app").classes("text-4xl muted")
+                ui.label("Изберете вид превозно средство и линия, за да видите къде са превозните средства на живо.").classes("text-sm muted text-center")
+            empty_hint.set_visibility(False)
+
+            # which color is which direction (single-line view only)
+            with ui.column().classes("soft w-full p-3 gap-1") as direction_box:
+                ui.label("Посока към").classes("text-xs font-semibold muted")
+                direction_body = ui.column().classes("gap-1")
+            direction_box.set_visibility(False)
+
+            # arrivals at a bus stop, or first/last train at a metro station
+            with ui.column().classes("soft w-full p-3 gap-1") as panel:
+                with ui.row().classes("w-full items-center justify-between no-wrap"):
+                    panel_title = ui.label().classes("text-base font-bold")
+                    ui.button(icon="close", on_click=lambda: close_panel()).props("flat round dense")
+                panel_sub = ui.label().classes("text-xs font-semibold muted")
+                panel_body = ui.column().classes("gap-2 w-full")
+            panel.set_visibility(False)
+
+            # air-quality scale (only in that mode)
+            with ui.column().classes("soft w-full p-3 gap-2") as air_legend:
+                ui.label("Фини прахови частици ФПЧ2.5, µg/m³").classes("text-xs font-semibold muted")
+                lower = 0
+                for limit, color, label in air.BANDS:
+                    rng = f"{lower}–{limit}" if limit != float("inf") else f"над {lower}"
+                    with ui.row().classes("items-center gap-3 no-wrap"):
+                        ui.element("span").style(f"width:16px;height:16px;border-radius:50%;background:{color};flex:none;box-shadow:inset 0 0 0 2px rgba(255,255,255,.7)")
+                        ui.label(label).classes("text-sm flex-1")
+                        ui.label(rng).classes("text-xs muted")
+                    lower = limit
+            air_legend.set_visibility(False)
+
+    handle = ui.button(icon="chevron_left", on_click=lambda: set_sidebar(state["closed"])).props("flat dense").classes("panel-handle").tooltip("Скрий / покажи панела")
+
+    # ---- sidebar / theme helpers ----------------------------------------------------------------------------------
+    def set_sidebar(open_: bool):
+        """Slide the panel in or out to the left."""
+        state["closed"] = not open_
+        for el in (sidebar, handle):
+            el.classes(remove="closed" if open_ else "", add="" if open_ else "closed")
+        handle.props(f"icon={'chevron_left' if open_ else 'chevron_right'}")
+
+    def toggle_dark():
+        dark.value = not dark.value
+        dark_btn.props(f"icon={'light_mode' if dark.value else 'dark_mode'}")
 
     def clear(group):
         for layer in group:
@@ -212,12 +171,29 @@ async def index():
             station.run_method("bindTooltip", f"<b>Метро {name}</b><br>" + ", ".join(ln for ln, _ in lines), {"direction": "top", "offset": [0, -14]})
             station_layers.append(station)
 
-    async def submit():
-        if mode["v"] == "air":
-            dialog.close()
+    # ---- tabs -----------------------------------------------------------------------------------------------------
+    async def on_tab(value):
+        if value == "air":
             await show_air()
-            return
-        line = line_input.value.strip()
+        else:
+            await leave_air()
+
+    async def leave_air():
+        state["mode"] = "transport"
+        clear(air_layers)
+        state["air_data"] = None
+        air_legend.set_visibility(False)
+        transport_box.set_visibility(True)
+        show_stations()
+        if state["last"]:
+            await show(*state["last"])
+        else:
+            empty_hint.set_visibility(True)
+            status.set_text("Изберете линия")
+
+    # ---- transport ------------------------------------------------------------------------------------------------
+    async def submit():
+        line = (line_input.value or "").strip()
         rtype = kind["type"]
         if not line and rtype is None:
             error.set_text("Въведете номер на линия или изберете вид превозно средство.")
@@ -226,19 +202,21 @@ async def index():
             what = f" ({KINDS[rtype][0].lower()})" if rtype is not None else ""
             error.set_text(f"Не е намерена линия „{line}“{what} в София.")
             return
-        dialog.close()
+        error.set_text("")
         state["type_view"] = None
         await show(line, rtype)
 
     async def show(line, rtype):
         """Show one line (with its stops), or (empty line) every line of a vehicle type."""
         state["mode"] = "transport"
+        state["last"] = (line, rtype)
         clear(air_layers)
         state["air_data"] = None
         air_legend.set_visibility(False)
+        empty_hint.set_visibility(False)
         show_stations()
         close_panel()
-        direction_card.set_visibility(False)
+        direction_box.set_visibility(False)
         ids = transit.find_routes(line, rtype)
         if not line:
             state["type_view"] = rtype
@@ -270,9 +248,9 @@ async def index():
                 route_layers.append(path)
                 with direction_body:
                     with ui.row().classes("items-center gap-2 no-wrap"):
-                        ui.element("span").style(f"width:22px;height:6px;border-radius:3px;background:{color};flex:none")
+                        ui.element("span").style(f"width:26px;height:6px;border-radius:3px;background:{color};flex:none")
                         ui.label((f"{TYPE_NAMES.get(rtype_, '')} " if multi_type else "") + head).classes("text-sm")
-        direction_card.set_visibility(bool(line) and bool(route_layers))
+        direction_box.set_visibility(bool(line) and bool(route_layers))
         for stop_id, name, lat, lon, stop_type, direction in stops:
             stop = m.marker(latlng=(lat, lon), options={"zIndexOffset": -500})
             stop.run_method(":setIcon", stop_icon(direction_color(stop_type, direction), stop_id))
@@ -287,7 +265,7 @@ async def index():
         panel_sub.set_text("Следващи пристигания")
         panel_body.clear()
         with panel_body:
-            ui.label("Зареждане…").classes("text-sm text-grey-7")
+            ui.label("Зареждане…").classes("text-sm muted")
         panel.set_visibility(True)
         await load_arrivals()
 
@@ -301,16 +279,16 @@ async def index():
         times = transit.metro_times.get(stop_id, {})
         with panel_body:
             if not times:
-                ui.label("Няма данни за разписанието.").classes("text-sm text-grey-7")
-            for kind, label in (("weekday", "Делник"), ("weekend", "Събота и неделя")):
-                if kind not in times:
+                ui.label("Няма данни за разписанието.").classes("text-sm muted")
+            for kind_, label in (("weekday", "Делник"), ("weekend", "Събота и неделя")):
+                if kind_ not in times:
                     continue
-                ui.label(label).classes("text-xs text-bold q-mt-sm")
-                for line, color, head, first, last in times[kind]:
-                    with ui.row().classes("items-center gap-2 no-wrap"):
-                        ui.label(line).style(f"background:{color};color:{'#222' if color.lower() == '#ffde17' else '#fff'};border-radius:10px;padding:0 8px;font-weight:700;min-width:38px;text-align:center")
+                ui.label(label).classes("text-xs font-semibold q-mt-sm")
+                for line, color, head, first, last in times[kind_]:
+                    with ui.row().classes("items-center gap-3 no-wrap"):
+                        chip(line, color, "#222" if color.lower() == "#ffde17" else "#fff")
                         with ui.column().classes("gap-0"):
-                            ui.label(f"→ {head}").classes("text-xs")
+                            ui.label(f"→ {head}").classes("text-xs muted")
                             ui.label(f"първи {clock(first)} · последен {clock(last)}").classes("text-sm")
         panel.set_visibility(True)
 
@@ -330,29 +308,32 @@ async def index():
             if err:
                 ui.label(err).classes("text-sm text-negative")
             elif not arrivals:
-                ui.label("Няма предстоящи пристигания по тази линия.").classes("text-sm text-grey-7")
+                ui.label("Няма предстоящи пристигания по тази линия.").classes("text-sm muted")
             for line, rtype, at, direction, head in arrivals:
                 minutes = round((at - now) / 60)
                 eta = "пристига" if minutes < 1 else f"след {minutes} мин"
-                clock = datetime.fromtimestamp(at, SOFIA_TZ).strftime("%H:%M")
                 color = direction_color(rtype, direction)  # same color as that direction on the map
-                with ui.row().classes("items-center gap-2 no-wrap"):
-                    ui.label(line).style(f"background:{color};color:#fff;border-radius:10px;padding:0 8px;font-weight:700;min-width:38px;text-align:center")
-                    with ui.column().classes("gap-0"):
-                        ui.label(f"{eta} · {clock}").classes("text-sm")
+                with ui.row().classes("items-center gap-3 no-wrap w-full"):
+                    chip(line, color)
+                    with ui.column().classes("gap-0 flex-1"):
+                        ui.label(eta).classes("text-sm font-semibold")
                         if head:
                             ui.label(f"→ {head}").classes("text-xs").style(f"color:{color}")
+                    ui.label(datetime.fromtimestamp(at, SOFIA_TZ).strftime("%H:%M")).classes("text-sm muted")
 
+    # ---- air quality ----------------------------------------------------------------------------------------------
     async def show_air():
         state["mode"] = "air"
         route_ids.clear()
         for group in (route_layers, stop_layers, layers, station_layers):
             clear(group)
         close_panel()
-        direction_card.set_visibility(False)
+        direction_box.set_visibility(False)
+        empty_hint.set_visibility(False)
+        transport_box.set_visibility(False)
         back.set_visibility(False)
         air_legend.set_visibility(True)
-        m.run_map_method("setView", list(SOFIA), 12)
+        m.run_map_method("fitBounds", [[42.62, 23.20], [42.77, 23.45]], {"paddingTopLeft": [SIDEBAR_PX + 30, 20], "paddingBottomRight": [20, 20]})
         status.set_text("Качество на въздуха: зареждане…")
         await refresh_air()
 
@@ -380,6 +361,7 @@ async def index():
         at = datetime.now(SOFIA_TZ).strftime("%H:%M:%S")
         status.set_text(f"Качество на въздуха: {len(data)} датчика · {at}")
 
+    # ---- live refresh ---------------------------------------------------------------------------------------------
     async def refresh(fit=False):
         if state["mode"] == "air":
             await refresh_air()
@@ -413,9 +395,9 @@ async def index():
             layers.append(layer)
         name = state["title"]
         at = datetime.now(SOFIA_TZ).strftime("%H:%M:%S")
-        status.set_text(f"{name}: {len(vehicles)} превозни средства в движение · {at}" if vehicles else f"{name}: в момента няма движещи се превозни средства · {at}")
+        status.set_text(f"{name}: {len(vehicles)} превозни средства · {at}" if vehicles else f"{name}: в момента няма движещи се превозни средства · {at}")
         if fit and vehicles:
-            m.run_map_method("fitBounds", [[v.lat, v.lon] for v in vehicles], {"padding": [60, 60], "maxZoom": 15})
+            m.run_map_method("fitBounds", [[v.lat, v.lon] for v in vehicles], {"paddingTopLeft": [SIDEBAR_PX + 30, 60], "paddingBottomRight": [60, 60], "maxZoom": 15})
         await load_arrivals()
 
     ui.on("line_pick", lambda e: show(e.args["line"], e.args["type"]))
@@ -435,9 +417,13 @@ async def index():
     await ui.context.client.connected()
     await m.initialized()
     show_stations()
-    status.set_text("Изберете линия")
     spinner.delete()
-    ask_line()
+    tabs.set_visibility(True)
+    transport_box.set_visibility(True)
+    empty_hint.set_visibility(True)
+    status.set_text("Изберете линия")
+    if await ui.run_javascript("window.innerWidth") < 700:  # phones: start with the map, open the panel from the menu button
+        set_sidebar(False)
 
 
 if __name__ in {"__main__", "__mp_main__"}:
