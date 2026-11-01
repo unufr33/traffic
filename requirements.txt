@@ -1,0 +1,4 @@
+nicegui>=2.0
+gtfs-realtime-bindings
+requests
+tzdata
